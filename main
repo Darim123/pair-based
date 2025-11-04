@@ -1,137 +1,77 @@
-from machine import Pin, PWM, UART, I2C
+from machine import Pin, UART, ADC
 import time
-from ads1x15 import ADS1015   # must be uploaded to both Picos
 
-# ----------- SETTINGS -----------
-IS_INITIATOR = True     # True on one Pico, False on the other
-UART_ID = 0
-UART_BAUD = 115200
-UART_TX_PIN = 0         # TX = GP0
-UART_RX_PIN = 1         # RX = GP1
-I2C_ID = 1
-I2C_SDA = 14
-I2C_SCL = 15
-ADS_ADDR = 0x48
-ADS_CHANNEL = 2          # ADS1015 A2 input
-PWM_OUT_PIN = 16
-PWM_FREQ = 1000
-TEST_DUTY_LIST = [10, 30, 50, 70, 90]
-# --------------------------------
+#ADC = reads analog voltages 
+#Pin for controls and reads voltage of the pin 
+# SETUP
+UART_ID = 1 #means were using the second uart port in the pico
+UART_TX_PIN = 4   # Will send data out through pin GP4
+UART_RX_PIN = 5   # Will receive data through pin GP5
+UART_BAUD = 9600 #Sets the communication speed = 9600 bits per second
 
-# ----------- HELPERS -----------
-def percent_to_duty(pct):
-    if pct < 0:
-        pct = 0
-    if pct > 100:
-        pct = 100
-    return int(pct * 65535 / 100)
+uart = UART(UART_ID, baudrate=UART_BAUD, tx=Pin(UART_TX_PIN), rx=Pin(UART_RX_PIN)) #basically saying use uart 1, communicate at speed 9600 and send on GP4
+adc = ADC(26)   # Sets up the ADC on pin GP26 (converts a voltage 0 to 3.3 into a number 0 t0 65535)
+msg_interval = 0.5  # Send data every half second
+last_send = time.ticks_ms() #returns the number of ms since pico was running.
+# last send keeps track of when the last message was sent to avoid spam 
 
-def read_voltage_percent(adc):
-    """Return analog voltage as % of 3.3V."""
-    raw = adc.read(0, ADS_CHANNEL)
-    volts = adc.raw_to_v(raw)
-    percent = (volts / 3.3) * 100
-    if percent < 0:
-        percent = 0
-    if percent > 100:
-        percent = 100
+# FUNCTIONS 
+def send_line(text):
+    uart.write(text + "\n") # Sends a string of text over the uart connection. +"/n" adds a newline character = end of a message
+
+def read_line(timeout_ms=2000): # Reads full line from uart, waiting up to the timeout.ms (2 seconds by default)
+
+    start = time.ticks_ms() # Saves the start time 
+    msg = b"" #makes an empty byte string (collect the characters we read)
+    while time.ticks_diff(time.ticks_ms(), start) < timeout_ms: #keeps checking until the timeout runs out
+        if uart.any(): #returns how many byts are available to read 
+            ch = uart.read(1) #reads 1 byte 
+            if ch:
+                msg += ch #each time we get a byte, we add it to msg
+                if b"\n" in msg: #when we see this, that means message ended
+                    try:
+                        return msg.decode().strip() #bytes to normal text. then remove spaces and newlines. then return the message 
+                    except:
+                        return None #if something goes wrong, return none
+        else:
+            time.sleep_ms(5) #Avoids wasting CPU when theres nothing to read usually after 2 seconds 
+    return None
+
+
+def read_pot_percent():
+    """Reads analog value (0–3.3V) and converts to percent 0–100"""
+    value = adc.read_u16()  # 0–65535 potentiometer voltage as a 16-bit number. 
+    percent = int((value / 65535) * 100) #Divides it by 65535 to get a fraction between 0.0 to 1.0. then we get a percentage
     return percent
 
-def send_line(uart, text):
-    uart.write(text + "\n")
+#MAIN LOOP 
+print(f"Pico active on UART{UART_ID} (TX{UART_TX_PIN}, RX{UART_RX_PIN})...") #Print a startup message so yk the pico is running and what pins its using. 
+#the f lets for curly braces 
+while True:
+    if not uart.any():
+        print("UART quiet - maybe TX/RX wire disconnected?")
+    
+    if time.ticks_diff(time.ticks_ms(), last_send) > msg_interval * 1000: #Checks if enought time has passed since the last message 
+        pot_val = read_pot_percent() #if yes, reads potent... position
+        msg = f"SET:{pot_val}" #buils a message string
+        send_line(msg) # send through uart
+        print("Sent:", msg)
+        last_send = time.ticks_ms() #updates last send to current time. 
 
-def read_line(uart, timeout_ms=2000):
-    start = time.ticks_ms()
-    msg = ""
-    while time.ticks_diff(time.ticks_ms(), start) < timeout_ms:
-        if uart.any():
-            ch = uart.read(1)
-            if ch:
-                if ch == b"\n":
-                    return msg
-                try:
-                    msg += ch.decode()
-                except:
-                    pass
-        else:
-            time.sleep_ms(5)
-    return None
-# --------------------------------
-
-# ----------- SETUP -----------
-pwm = PWM(Pin(PWM_OUT_PIN))
-pwm.freq(PWM_FREQ)
-pwm.duty_u16(percent_to_duty(0))
-
-uart = UART(UART_ID, baudrate=UART_BAUD, tx=Pin(UART_TX_PIN), rx=Pin(UART_RX_PIN))
-i2c = I2C(I2C_ID, sda=Pin(I2C_SDA), scl=Pin(I2C_SCL))
-adc = ADS1015(i2c, ADS_ADDR, 1)
-
-print("Role:", "INITIATOR" if IS_INITIATOR else "RESPONDER")
-print("I2C devices:", [hex(a) for a in i2c.scan()])
-print("Setup complete.\n")
-# --------------------------------
-
-# -------- ERROR TEST CASE --------
-def run_error_case():
-    """Simulate and detect a communication or data error."""
-    print("Running error test case...")
-    bad_msg = "BAD_DATA:xyz"
-    send_line(uart, bad_msg)
-    reply = read_line(uart, timeout_ms=2000)
-    if reply is None or not reply.startswith("MEAS:"):
-        print("Error test passed: system handled invalid message safely.\n")
-    else:
-        print("Error test warning: unexpected reply to invalid data.\n")
-# --------------------------------
-
-# -------- MAIN LOOPS --------
-def initiator_loop():
-    index = 0
-    while True:
-        duty = TEST_DUTY_LIST[index % len(TEST_DUTY_LIST)]
-        index += 1
-        pwm.duty_u16(percent_to_duty(duty))
-        send_line(uart, "SET:" + str(duty))
-
-        reply = read_line(uart, timeout_ms=3000)
-        if reply and reply.startswith("MEAS:"):
+    # Listen for incoming messages
+    incoming = read_line(timeout_ms=200) #tries to read for up to 0.2 seconds. IF arrives, store in incoming
+    if incoming:
+        if incoming.startswith("SET:"): #set means the other pico is telling us a target position 
             try:
-                measured = float(reply[5:].strip())
-                error = duty - measured
-                print("Set", duty, "% | Measured", round(measured, 1), "% | Error", round(error, 1), "%")
+                val = float(incoming[4:]) #means everything after the fourth chrafcter 
+                # Reply with measurement echo (simulate reading)
+                reply = f"MEAS:{val:.1f}"
+                send_line(reply)
+                print("Received:", incoming, "| Replied:", reply)
             except:
-                print("Bad MEAS message.")
-        else:
-            print("No valid reply.")
-        time.sleep(1.5)
-
-def responder_loop():
-    while True:
-        msg = read_line(uart, timeout_ms=10000)
-        if msg is None:
-            continue
-
-        if msg.startswith("SET:"):
-            try:
-                duty = float(msg[4:].strip())
-            except:
-                duty = None
-            meas = read_voltage_percent(adc)
-            send_line(uart, "MEAS:" + str(round(meas, 1)))
-            if duty is not None:
-                err = duty - meas
-                print("Asked", duty, "% | Measured", round(meas, 1), "% | Error", round(err, 1), "%")
-        else:
-            # ignore bad or unrelated input
-            continue
-# --------------------------------
-
-# -------- PROGRAM START --------
-print("Starting program...\n")
-
-if IS_INITIATOR:
-    run_error_case()
-    initiator_loop()
-else:
-    responder_loop()
+                send_line("ERR")
+        elif incoming.startswith("MEAS:"): #if the message begins with meas, that a measurement reply 
+            print("Measurement received:", incoming[5:]) #it prints the number part only (skippng the characters)
+        else: 
+            print("Unknown or corrupted message recieved:", incoming)
+    time.sleep(0.05) #short 50 ms pause to prevent the pico from running the loop to fast. makes output readable. 
